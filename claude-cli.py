@@ -7,7 +7,7 @@ import requests
 import signal
 import tempfile
 import subprocess
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, Union, List, Dict, Tuple
 from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -81,38 +81,83 @@ class History:
     def __init__(self):
         self.session_history = []
 
-    def extract_commands(self, text: str) -> List[str]:
+    def test_command(self, command: str, language: str) -> Tuple[bool, str]:
         """
-        Extract commands from various code block formats.
-        Handles both ```bash and plain ``` blocks, preserving special characters.
+        Test if a command has valid syntax without executing it.
+        Returns a tuple of (is_valid, error_message).
+        """
+        if language == 'bash':
+            try:
+                process = subprocess.run(
+                    ['bash', '-n'],
+                    input=command,
+                    text=True,
+                    capture_output=True
+                )
+                is_valid = process.returncode == 0
+                error_msg = process.stderr.strip()
+                return is_valid, error_msg
+            except Exception as e:
+                return False, f"Error checking bash syntax: {str(e)}"
+
+        elif language == 'python':
+            try:
+                compile(command, '<string>', 'exec')
+                return True, ""
+            except Exception as e:
+                return False, str(e)
+
+        return False, f"Unsupported language: {language}"
+
+    def extract_commands(self, text: str, validate: bool = True) -> List[Tuple[str, str, str]]:
+        """
+        Extract and optionally validate commands from code blocks.
+        Returns a list of tuples: (command, language, error_message).
         """
         commands = []
         lines = text.split('\n')
         in_block = False
         current_block = []
+        current_language = None
+        valid_languages = {'bash', 'python'}
 
         for line in lines:
             stripped = line.strip()
-            # Match both ```bash and ``` starts
+
             if stripped.startswith('```') and not in_block:
-                in_block = True
-                current_block = []
+                # Extract the language specification
+                language = stripped[3:].strip().lower()
+                if language in valid_languages:
+                    in_block = True
+                    current_block = []
+                    current_language = language
             elif stripped == '```' and in_block:
-                if current_block:
-                    # Join and strip to handle any leading/trailing whitespace
+                if current_block and current_language:
                     command = '\n'.join(current_block).strip()
-                    if command:  # Only add non-empty commands
-                        commands.append(command)
+                    if command:
+                        if validate:
+                            is_valid, error_msg = self.test_command(command, current_language)
+                            commands.append((command, current_language, error_msg))
+                        else:
+                            commands.append((command, current_language, ""))
                 in_block = False
                 current_block = []
+                current_language = None
             elif in_block:
-                # If first line was ```bash, skip it
-                if current_block or not stripped == 'bash':
-                    current_block.append(line)
+                current_block.append(line)
 
         return commands
 
+    def get_valid_commands(self, text: str) -> List[Tuple[str, str]]:
+        """
+        Extract only the syntactically valid commands.
+        Returns a list of tuples: (command, language)
+        """
+        all_commands = self.extract_commands(text, validate=True)
+        return [(cmd, lang) for cmd, lang, err in all_commands if not err]
+
     def add_interaction(self, message: str, response: str) -> None:
+        """Add a user-assistant interaction to the history."""
         self.session_history.append({
             'user': message,
             'assistant': response,
@@ -120,7 +165,7 @@ class History:
         })
 
     def get_messages_for_api(self) -> List[Dict]:
-        """Convert history into format suitable for API messages"""
+        """Convert history into format suitable for API messages."""
         messages = []
         for interaction in self.session_history[-10:]:  # Limit to last 10 messages
             messages.extend([
@@ -129,10 +174,15 @@ class History:
             ])
         return messages
 
-    def get_last_commands(self) -> List[str]:
+    def get_last_commands(self) -> List[Tuple[str, str]]:
+        """
+        Get commands from the last interaction.
+        Returns a list of tuples: (command, language)
+        """
         if not self.session_history:
             return []
-        return self.session_history[-1].get('commands', [])
+        last_response = self.session_history[-1].get('assistant', '')
+        return self.get_valid_commands(last_response)
 
     def clear_history(self) -> None:
         self.session_history = []
@@ -212,20 +262,33 @@ class Executor:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             raise KeyboardInterrupt
 
-    def execute_command(self, cmd: str, capture_output: bool = True) -> Optional[str]:
+    def execute_command(self, command: Union[str, Tuple[str, str]], capture_output: bool = True) -> Optional[str]:
         """
         Execute a command and optionally capture its output.
 
         Args:
-            cmd: The command to execute
+            command: Either a string (assumed to be bash) or a tuple of (command_string, language)
             capture_output: If True, returns the command output. If False, returns None
                           but still executes interactively.
         """
-        if not cmd.strip():
+        # Convert string command to tuple format
+        if isinstance(command, str):
+            cmd_tuple = (command, 'bash')
+        else:
+            cmd_tuple = command
+
+        if not cmd_tuple or len(cmd_tuple) != 2:
+            print("Invalid command provided")
+            return None
+
+        cmd, language = cmd_tuple
+        if not cmd:
             print("No command provided")
             return None
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp:
+        # Create temporary file with appropriate extension
+        file_extension = '.py' if language == 'python' else '.sh'
+        with tempfile.NamedTemporaryFile(mode='w', suffix=file_extension, delete=False) as tmp:
             tmp.write(cmd)
             tmp_path = tmp.name
 
@@ -237,13 +300,19 @@ class Executor:
             env = os.environ.copy()
             env.pop('ANTHROPIC_API_KEY', None)
 
-            print(f"\nExecuting command:\n{cmd}\n---")
+            print(f"\nExecuting {language} command:\n{cmd}\n---")
 
-            # Always use script for recording, but only save output if capture_output is True
+            # Create the execution command based on language
+            if language == 'python':
+                exec_cmd = f'python {tmp_path}'
+            else:  # bash
+                exec_cmd = f'bash {tmp_path}'
+
+            # Always use script for recording
             with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as rec:
                 self.recording_file = rec.name
 
-            script_cmd = ['script', '-q', '-c', f'bash {tmp_path}', self.recording_file]
+            script_cmd = ['script', '-q', '-c', exec_cmd, self.recording_file]
 
             self.current_process = subprocess.Popen(
                 script_cmd,
@@ -400,7 +469,7 @@ class StyledCLI:
                 return True
             elif cmd.startswith("!run"):
                 parts = cmd.split(maxsplit=1)
-                block_num = parts[1] if len(parts) > 1 else "1"
+                block_num = parts[1] if len(parts) > 1 else "all"
 
                 commands = self.history.get_last_commands()
                 if not commands:
