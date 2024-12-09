@@ -3,14 +3,19 @@
 import os
 import sys
 import json
+import requests
 import signal
 import tempfile
 import subprocess
-import requests
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, List, Dict
 from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import HTML
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 class Config:
     def __init__(self):
@@ -238,67 +243,117 @@ class Executor:
             self.current_process = None
             self.recording_file = None
 
-
-class CLI:
+class StyledCLI:
     def __init__(self):
+        self.console = Console()
+        self.style = Style.from_dict({
+            'prompt': '#666666',    # Subtle gray for brackets
+            'username': '#00A67D',  # Anthropic green for "claude"
+            'at': '#666666',        # Gray separator
+            'path': '#87CEEB',      # Sky blue for path
+            'arrow': '#00A67D',     # Anthropic green for prompt arrow
+        })
+
+        # Rest of the initialization code remains the same
         self.config = Config()
         self.api = API(os.getenv('ANTHROPIC_API_KEY'))
-        self.history = History()  # No longer needs history_file
+        self.history = History()
         self.executor = Executor()
         self.command_outputs = []
 
-        # Keep command history in a file for cursor-up functionality
         history_dir = Path.home() / '.claude-cli'
         history_dir.mkdir(exist_ok=True)
+
         self.session = PromptSession(
-            history=FileHistory(str(history_dir / 'command_history'))
+            history=FileHistory(str(Path.home() / '.claude-cli' / 'command_history')),
+            style=self.style
         )
 
-    def save_conversation(self, filename: str) -> None:
-        """Save the current session's conversation history to a file"""
-        try:
-            filepath = Path(filename)
-            if not filepath.suffix:
-                filepath = filepath.with_suffix('.json')
+    def get_styled_prompt(self) -> HTML:
+        username = os.getenv('USER', 'user')
+        hostname = os.uname().nodename
+        cwd = os.getcwd()
+        home = str(Path.home())
 
-            with open(filepath, 'w') as f:
-                json.dump(self.history.session_history, f, indent=2)
-            print(f"Conversation saved to {filepath}")
-        except Exception as e:
-            print(f"Error saving conversation: {e}")
+        # Replace home directory with ~
+        if cwd.startswith(home):
+            cwd = '~' + cwd[len(home):]
 
-    def load_conversation(self, filename: str) -> None:
-        """Load conversation history from a file into the current session"""
-        try:
-            filepath = Path(filename)
-            with open(filepath) as f:
-                loaded_history = json.load(f)
-            self.history.session_history = loaded_history
-            print(f"Conversation loaded from {filepath}")
-        except Exception as e:
-            print(f"Error loading conversation: {e}")
+        return HTML(
+            '<prompt>'
+            '?<username>claude</username>'
+            '<at>:</at>'
+            '<path>{}</path>?'
+            '<arrow>?</arrow> '
+            '</prompt>'.format(cwd)
+        )
+
+    def print_welcome(self):
+        welcome_text = Text()
+        welcome_text.append("Claude CLI", style="bold cyan")
+        welcome_text.append(" - Interactive Mode\n\n", style="dim")
+
+        commands = [
+            ("!exit", "Exit the program"),
+            ("!clear", "Clear current session history"),
+            ("!run [n]", "Run command block n (default: 1)"),
+            ("!run all", "Run all command blocks"),
+            ("!run select", "Choose command block interactively"),
+            ("!bash / !python", "Start a bash or python interactive session"),
+            ("!share", "Share last command output with Claude"),
+            ("!save <file>", "Save current session to file"),
+            ("!load <file>", "Load conversation from file"),
+            ("Ctrl+C", "Stop running command"),
+            ("Ctrl+D", "Exit the program"),
+            ("Up/Down", "Navigate command history")
+        ]
+
+        # Create command help text
+        help_text = Text()
+        help_text.append("Commands:\n", style="bold yellow")
+
+        max_cmd_length = max(len(cmd[0]) for cmd in commands)
+
+        for cmd, desc in commands:
+            help_text.append(f"  {cmd:<{max_cmd_length+2}}", style="cyan")
+            help_text.append(f"{desc}\n", style="white")
+
+        panel = Panel(
+            help_text,
+            title="[bold]Available Commands",
+            border_style="blue"
+        )
+
+        self.console.print(welcome_text)
+        self.console.print(panel)
+
+    def print_command_output(self, command: str, output: str):
+        self.console.print(
+            Panel(
+                Text(output),
+                title=f"[bold blue]Command Output: [white]{command}",
+                border_style="blue"
+            )
+        )
+
+    def print_error(self, message: str):
+        self.console.print(f"[bold red]Error:[/bold red] {message}")
+
+    def print_success(self, message: str):
+        self.console.print(f"[bold green]Success:[/bold green] {message}")
 
     def interactive_mode(self):
-        print("\nClaude CLI - Interactive Mode")
-        print("Commands:")
-        print("  !exit         Exit the program")
-        print("  !clear        Clear current session history")
-        print("  !run [n]      Run command block n (default: 1)")
-        print("  !run all      Run all command blocks")
-        print("  !run select   Choose command block interactively")
-        print("  !share        Share last command output with Claude")
-        print("  !save <file>  Save current session to file")
-        print("  !load <file>  Load conversation from file")
-        print("  Ctrl+C        Stop running command")
-        print("  Ctrl+D        Exit the program")
-        print("  Up/Down       Navigate command history")
+        self.print_welcome()
 
         while True:
             try:
-                user_input = self.session.prompt("\n> ").strip()
+                user_input = self.session.prompt(
+                    lambda: self.get_styled_prompt()
+                ).strip()
 
                 if not user_input:
                     continue
+
 
                 if not self.handle_command(user_input):
                     # Get previous messages for context
@@ -314,12 +369,12 @@ class CLI:
                     self.history.add_interaction(user_input, response)
 
             except KeyboardInterrupt:
-                print("\nUse !exit to quit")
+                self.console.print("\n[yellow]Use <Ctrl>+D or !exit[/yellow]")
             except EOFError:
-                print("\nGoodbye!")
+                self.console.print("\n[green]Goodbye![/green]")
                 sys.exit(0)
             except Exception as e:
-                print(f"Error: {e}")
+                self.print_error(str(e))
 
     def single_message_mode(self, message: str):
         previous_messages = self.history.get_messages_for_api()
@@ -336,7 +391,7 @@ class CLI:
                 sys.exit(0)
             elif cmd == "!clear":
                 self.history.clear_history()
-                self.command_outputs.clear()  # Clear stored outputs
+                self.command_outputs.clear()
                 print("History cleared")
                 return True
             elif cmd.startswith("!save "):
@@ -346,6 +401,20 @@ class CLI:
             elif cmd.startswith("!load "):
                 filename = cmd.split(maxsplit=1)[1]
                 self.load_conversation(filename)
+                return True
+            elif cmd.startswith("!bash"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) > 1:
+                    self.run_bash_command(parts[1])
+                else:
+                    self.run_bash_command()
+                return True
+            elif cmd.startswith("!python"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) > 1:
+                    self.run_python_command(parts[1])
+                else:
+                    self.run_python_command()
                 return True
 
             elif cmd.startswith("!run"):
@@ -372,19 +441,57 @@ class CLI:
                             break
 
                 elif block_num == "select":
-                    print("\nAvailable commands:")
-                    for i, cmd in enumerate(commands, 1):
-                        print(f"\nBlock {i}:\n{cmd}")
-                    try:
-                        selection = int(input("\nSelect block number: "))
-                        if 1 <= selection <= len(commands):
-                            output = self.executor.execute_command(commands[selection-1], capture_output=True)
-                            if output:
-                                self.command_outputs.append((selection, output))
-                    except ValueError:
-                        print("Invalid selection")
-                    except KeyboardInterrupt:
-                        print("\nSelection cancelled")
+                    history_index = len(self.history.session_history) - 1  # Start with most recent
+
+                    while history_index >= 0:
+                        # Get commands from this response
+                        if history_index == len(self.history.session_history) - 1:
+                            # Most recent response
+                            commands = self.history.get_last_commands()
+                            context = "Current response"
+                        else:
+                            # Previous response
+                            interaction = self.history.session_history[history_index]
+                            commands = interaction.get('commands', [])
+                            user_msg = interaction['user']
+                            context = (user_msg[:50] + '...') if len(user_msg) > 50 else user_msg
+
+                        if commands:
+                            print(f"\n{context}:")
+                            for i, cmd in enumerate(commands, 1):
+                                print(f"\nBlock {i}:\n{cmd}")
+
+                            try:
+                                selection = input("\nSelect block number (or press Enter for older commands, 'q' to cancel): ").strip().lower()
+
+                                if selection == 'q':
+                                    print("Selection cancelled")
+                                    break
+                                elif selection == '':
+                                    history_index -= 1
+                                    continue
+
+                                try:
+                                    block_num = int(selection)
+                                    if 1 <= block_num <= len(commands):
+                                        output = self.executor.execute_command(commands[block_num-1], capture_output=True)
+                                        if output:
+                                            self.command_outputs.append((block_num, output))
+                                        break
+                                    else:
+                                        print(f"Block number {selection} out of range")
+                                except ValueError:
+                                    print(f"Invalid input: {selection}")
+
+                            except KeyboardInterrupt:
+                                print("\nSelection cancelled")
+                                break
+                        else:
+                            history_index -= 1
+
+                    if history_index < 0:
+                        print("No more commands found in history")
+
                 else:
                     try:
                         idx = int(block_num) - 1
@@ -396,9 +503,14 @@ class CLI:
                             print(f"Block number {block_num} out of range")
                     except ValueError:
                         print(f"Invalid block number: {block_num}")
+
                 return True
 
-            elif cmd == "!share":
+
+            elif cmd.startswith("!share"):
+                parts = cmd.split(maxsplit=1)
+                additional_context = parts[1] if len(parts) > 1 else ""
+
                 if self.command_outputs:
                     # Format multiple outputs with block numbers
                     formatted_outputs = "\n\n".join([
@@ -406,27 +518,170 @@ class CLI:
                         for block_num, output in self.command_outputs
                     ])
 
+                    # Combine the outputs with any additional context
+                    message = f"Here is the output from my commands:\n\n{formatted_outputs}"
+                    if additional_context:
+                        message = f"{additional_context}\n\n{message}"
+
                     response = self.api.send_message(
-                        f"Here is the output from my commands:\n\n{formatted_outputs}",
-                        self.config.get_system_prompt()
+                        message,
+                        self.config.get_system_prompt(),
+                        self.history.get_messages_for_api()  # Include conversation history
                     )
                     print(response)
                     self.history.add_interaction(
-                        f"Command outputs:\n{formatted_outputs}",
+                        f"Command outputs with context: {additional_context}\n{formatted_outputs}",
                         response
                     )
                 else:
                     print("No command outputs to share")
                 return True
 
-            return False
-
         except KeyboardInterrupt:
             print("\nCommand cancelled")
             return True
 
+    def run_bash_command(self, command: Optional[str] = None) -> None:
+        """
+        Run a bash command or start an interactive bash session.
+
+        Args:
+            command: Optional command string. If None, starts interactive session.
+        """
+        env = os.environ.copy()
+        env.pop('ANTHROPIC_API_KEY', None)  # Don't expose API key to shell
+
+        if command:
+            # Run single command
+            try:
+                output = self.executor.execute_command(command, capture_output=True)
+                if output:
+                    self.command_outputs.append((-1, output))  # Use -1 to indicate direct bash command
+                    # Add the command and output to conversation history
+                    self.history.add_interaction(
+                        f"!bash {command}",
+                        f"Bash command output:\n```\n{output}\n```"
+                    )
+            except Exception as e:
+                error_msg = f"Error executing command: {e}"
+                print(error_msg)
+                self.history.add_interaction(
+                    f"!bash {command}",
+                    f"Error:\n```\n{error_msg}\n```"
+                )
+        else:
+            # Start interactive bash session with script recording
+            print("\nStarting interactive bash session (type 'exit' to return to Claude CLI)")
+            print("---")
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as typescript:
+                try:
+                    shell = os.environ.get('SHELL', '/bin/bash')
+                    # Use script to record the session
+                    subprocess.run(['script', '-q', typescript.name, shell], env=env)
+
+                    # Read the typescript file
+                    with open(typescript.name, 'r', errors='replace') as f:
+                        session_output = f.read()
+
+                    # Add the session to conversation history
+                    self.history.add_interaction(
+                        "!bash (interactive session)",
+                        f"Bash session transcript:\n```\n{session_output}\n```"
+                    )
+
+                except KeyboardInterrupt:
+                    print("\nBash session terminated")
+                    # Add the interrupted session to history
+                    with open(typescript.name, 'r', errors='replace') as f:
+                        session_output = f.read()
+                    self.history.add_interaction(
+                        "!bash (interactive session - interrupted)",
+                        f"Interrupted bash session transcript:\n```\n{session_output}\n```"
+                    )
+                finally:
+                    os.unlink(typescript.name)
+            print("---")
+
+    def run_python_command(self, command: Optional[str] = None) -> None:
+        """
+        Run a Python command or start an interactive Python session.
+
+        Args:
+            command: Optional command string. If None, starts interactive session.
+        """
+        env = os.environ.copy()
+        env.pop('ANTHROPIC_API_KEY', None)  # Don't expose API key to Python
+
+        if command:
+            # Create a temporary Python script
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+                tmp.write(command)
+                tmp_path = tmp.name
+
+            try:
+                # Run the script and capture output
+                result = subprocess.run(
+                    [sys.executable, tmp_path],
+                    env=env,
+                    text=True,
+                    capture_output=True
+                )
+                output = result.stdout
+                if result.stderr:
+                    output = output + "\nErrors:\n" + result.stderr
+                if output:
+                    self.command_outputs.append((-2, output))  # Use -2 to indicate direct python command
+                    # Add command and output to conversation history
+                    self.history.add_interaction(
+                        f"!python {command}",
+                        f"Python output:\n```\n{output}\n```"
+                    )
+            except Exception as e:
+                error_msg = f"Error executing Python command: {e}"
+                print(error_msg)
+                self.history.add_interaction(
+                    f"!python {command}",
+                    f"Error:\n```\n{error_msg}\n```"
+                )
+            finally:
+                os.unlink(tmp_path)
+        else:
+            # Start interactive Python session with transcript recording
+            print("\nStarting interactive Python session (use exit() to return to Claude CLI)")
+            print("---")
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as typescript:
+                try:
+                    # Use script to record the interactive session
+                    subprocess.run(['script', '-q', typescript.name, sys.executable, '-i'], env=env)
+
+                    # Read the typescript file
+                    with open(typescript.name, 'r', errors='replace') as f:
+                        session_output = f.read()
+
+                    # Add the session to conversation history
+                    self.history.add_interaction(
+                        "!python (interactive session)",
+                        f"Python session transcript:\n```\n{session_output}\n```"
+                    )
+
+                except KeyboardInterrupt:
+                    print("\nPython session terminated")
+                    # Add the interrupted session to history
+                    with open(typescript.name, 'r', errors='replace') as f:
+                        session_output = f.read()
+                    self.history.add_interaction(
+                        "!python (interactive session - interrupted)",
+                        f"Interrupted Python session transcript:\n```\n{session_output}\n```"
+                    )
+                finally:
+                    os.unlink(typescript.name)
+            print("---")
+
+
 def main():
-    cli = CLI()
+    cli = StyledCLI()
 
     if len(sys.argv) > 1:
         if sys.argv[1] in ['-h', '--help']:
