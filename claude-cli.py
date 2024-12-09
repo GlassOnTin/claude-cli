@@ -81,12 +81,16 @@ class History:
     def __init__(self):
         self.session_history = []
 
-    def test_command(self, command: str, language: str) -> Tuple[bool, str]:
+    def test_command(self, command: str, language: str = 'bash') -> Tuple[bool, str]:
         """
         Test if a command has valid syntax without executing it.
         Returns a tuple of (is_valid, error_message).
         """
         if language == 'bash':
+            # If it's a single-line command without special chars, consider it valid
+            if '\n' not in command and not any(c in command for c in '&|;<>()'):
+                return True, ""
+
             try:
                 process = subprocess.run(
                     ['bash', '-n'],
@@ -446,7 +450,13 @@ class StyledCLI:
 
     def handle_command(self, cmd: str) -> bool:
         try:
-            if cmd == "!exit":
+            if cmd.startswith("!run"):
+                parts = cmd.split(maxsplit=1)
+                block_spec = parts[1] if len(parts) > 1 else "1"
+                self.handle_run_command(block_spec)
+                return True
+
+            elif cmd == "!exit":
                 print("\nFinal Usage:")
                 print(self.config.token_usage.get_summary())
                 sys.exit(0)
@@ -467,92 +477,19 @@ class StyledCLI:
                 filename = cmd.split(maxsplit=1)[1]
                 self.history.load_conversation(filename)
                 return True
-            elif cmd.startswith("!run"):
-                parts = cmd.split(maxsplit=1)
-                block_num = parts[1] if len(parts) > 1 else "all"
-
-                commands = self.history.get_last_commands()
-                if not commands:
-                    print("No commands found in last response")
-                    return True
-
-                self.command_outputs.clear()
-
-                if block_num == "all":
-                    for i, cmd in enumerate(commands, 1):
-                        print(f"\nExecuting block {i}:")
-                        try:
-                            output = self.executor.execute_command(cmd, capture_output=True)
-                            if output:
-                                self.command_outputs.append((i, output))
-                        except KeyboardInterrupt:
-                            print("\nExecution stopped by user")
-                            break
-
-                elif block_num == "select":
-                    history_index = len(self.history.session_history) - 1  # Start with most recent
-
-                    while history_index >= 0:
-                        # Get commands from this response
-                        if history_index == len(self.history.session_history) - 1:
-                            # Most recent response
-                            commands = self.history.get_last_commands()
-                            context = "Current response"
-                        else:
-                            # Previous response
-                            interaction = self.history.session_history[history_index]
-                            commands = interaction.get('commands', [])
-                            user_msg = interaction['user']
-                            context = (user_msg[:50] + '...') if len(user_msg) > 50 else user_msg
-
-                        if commands:
-                            print(f"\n{context}:")
-                            for i, cmd in enumerate(commands, 1):
-                                print(f"\nBlock {i}:\n{cmd}")
-
-                            try:
-                                selection = input("\nSelect block number (or press Enter for older commands, 'q' to cancel): ").strip().lower()
-
-                                if selection == 'q':
-                                    print("Selection cancelled")
-                                    break
-                                elif selection == '':
-                                    history_index -= 1
-                                    continue
-
-                                try:
-                                    block_num = int(selection)
-                                    if 1 <= block_num <= len(commands):
-                                        output = self.executor.execute_command(commands[block_num-1], capture_output=True)
-                                        if output:
-                                            self.command_outputs.append((block_num, output))
-                                        break
-                                    else:
-                                        print(f"Block number {selection} out of range")
-                                except ValueError:
-                                    print(f"Invalid input: {selection}")
-
-                            except KeyboardInterrupt:
-                                print("\nSelection cancelled")
-                                break
-                        else:
-                            history_index -= 1
-
-                    if history_index < 0:
-                        print("No more commands found in history")
-
-                else:
-                    try:
-                        idx = int(block_num) - 1
-                        if 0 <= idx < len(commands):
-                            output = self.executor.execute_command(commands[idx], capture_output=True)
-                            if output:
-                                self.command_outputs.append((idx + 1, output))
-                        else:
-                            print(f"Block number {block_num} out of range")
-                    except ValueError:
-                        print(f"Invalid block number: {block_num}")
-
+            elif cmd.startswith("!bash "):
+                command = cmd[6:].strip()  # Remove !bash prefix
+                self.run_bash_command(command)
+                return True
+            elif cmd == "!bash":
+                self.run_bash_command()  # Start interactive bash session
+                return True
+            elif cmd.startswith("!python "):
+                command = cmd[8:].strip()  # Remove !python prefix
+                self.run_python_command(command)
+                return True
+            elif cmd == "!python":
+                self.run_python_command()  # Start interactive python session
                 return True
 
             elif cmd.startswith("!share"):
@@ -592,12 +529,125 @@ class StyledCLI:
             print("\nCommand cancelled")
             return True
 
+    def handle_run_command(self, block_spec: str = "1") -> None:
+        """
+        Handle the !run command with various arguments:
+        - number: Run specific block
+        - 'all': Run all blocks
+        - 'select': Interactively select block
+        - raw command: Execute as bash command
+        """
+        commands = self.history.get_last_commands()
+        if not commands:
+            print("No commands found in last response")
+            return
+
+        self.command_outputs.clear()
+
+        # Handle "all" command blocks
+        if block_spec == "all":
+            self._run_all_blocks(commands)
+            return
+
+        # Handle interactive selection
+        if block_spec == "select":
+            self._run_interactive_selection()
+            return
+
+        # Handle numeric block selection
+        try:
+            if block_spec.isdigit():
+                block_num = int(block_spec)
+                if 1 <= block_num <= len(commands):
+                    output = self.executor.execute_command(commands[block_num - 1], capture_output=True)
+                    if output:
+                        self.command_outputs.append((block_num, output))
+                else:
+                    print(f"Block number {block_spec} out of range")
+                return
+        except ValueError:
+            pass
+
+        # If we get here, treat as direct bash command
+        is_valid, error_msg = self.history.test_command(block_spec)
+        if is_valid:
+            output = self.executor.execute_command((block_spec, 'bash'), capture_output=True)
+            if output:
+                self.command_outputs.append((-1, output))
+        else:
+            print(f"Invalid bash command: {error_msg}")
+
+    def _run_all_blocks(self, commands: List[Tuple[str, str]]) -> None:
+        """Execute all command blocks in sequence."""
+        for i, cmd in enumerate(commands, 1):
+            print(f"\nExecuting block {i}:")
+            try:
+                output = self.executor.execute_command(cmd, capture_output=True)
+                if output:
+                    self.command_outputs.append((i, output))
+            except KeyboardInterrupt:
+                print("\nExecution stopped by user")
+                break
+
+    def _run_interactive_selection(self) -> None:
+        """Handle interactive block selection from history."""
+        history_index = len(self.history.session_history) - 1
+
+        while history_index >= 0:
+            # Get commands for current history entry
+            if history_index == len(self.history.session_history) - 1:
+                commands = self.history.get_last_commands()
+                context = "Current response"
+            else:
+                interaction = self.history.session_history[history_index]
+                commands = self.history.get_valid_commands(interaction['assistant'])
+                user_msg = interaction['user']
+                context = (user_msg[:50] + '...') if len(user_msg) > 50 else user_msg
+
+            if commands:
+                print(f"\n{context}:")
+                for i, cmd in enumerate(commands, 1):
+                    cmd_str, lang = cmd
+                    print(f"\nBlock {i} ({lang}):\n{cmd_str}")
+
+                try:
+                    selection = input("\nSelect block number (or press Enter for older commands, 'q' to cancel): ").strip().lower()
+
+                    if selection == 'q':
+                        print("Selection cancelled")
+                        break
+                    elif selection == '':
+                        history_index -= 1
+                        continue
+
+                    try:
+                        block_num = int(selection)
+                        if 1 <= block_num <= len(commands):
+                            output = self.executor.execute_command(commands[block_num-1], capture_output=True)
+                            if output:
+                                self.command_outputs.append((block_num, output))
+                            break
+                        else:
+                            print(f"Block number {selection} out of range")
+                    except ValueError:
+                        print(f"Invalid input: {selection}")
+
+                except KeyboardInterrupt:
+                    print("\nSelection cancelled")
+                    break
+            else:
+                history_index -= 1
+
+        if history_index < 0:
+            print("No more commands found in history")
+
     def run_bash_command(self, command: Optional[str] = None) -> None:
         """Run a bash command or start an interactive bash session."""
         env = os.environ.copy()
         env.pop('ANTHROPIC_API_KEY', None)  # Don't expose API key to shell
 
-        if command:
+        if command and command.trim():
+            print(f"Running bash command: {command}")
             try:
                 output = self.executor.execute_command(command, capture_output=True)
                 if output:
@@ -620,7 +670,7 @@ class StyledCLI:
             with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as typescript:
                 try:
                     shell = os.environ.get('SHELL', '/bin/bash')
-                    subprocess.run(['script', '-q', typescript.name, shell], env=env)
+                    subprocess.run(['script', typescript.name, '-q'], env=env)
 
                     with open(typescript.name, 'r', errors='replace') as f:
                         session_output = f.read()
