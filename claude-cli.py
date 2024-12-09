@@ -7,7 +7,7 @@ import requests
 import signal
 import tempfile
 import subprocess
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -17,11 +17,26 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+class TokenUsage:
+    def __init__(self):
+        self.total_tokens = 0
+        self.cost_per_million = 3.0  # $3 per million tokens
+
+    def add_tokens(self, count: int) -> None:
+        self.total_tokens += count
+
+    def get_cost(self) -> float:
+        return (self.total_tokens / 1_000_000) * self.cost_per_million
+
+    def get_summary(self) -> str:
+        return f"Total tokens: {self.total_tokens:,}\nEstimated cost: ${self.get_cost():.4f}"
+
 class Config:
     def __init__(self):
         self.check_dependencies()
         self.check_environment()
         self.history_file = self.init_history()
+        self.token_usage = TokenUsage()
 
     @staticmethod
     def check_dependencies() -> None:
@@ -61,7 +76,6 @@ They can then share the output with you using a !share command.
 
 Current context:
 Directory: {os.getcwd()}"""
-
 
 class History:
     def __init__(self):
@@ -123,13 +137,21 @@ class History:
     def clear_history(self) -> None:
         self.session_history = []
 
+    def save_conversation(self, filename: str) -> None:
+        with open(filename, 'w') as f:
+            json.dump(self.session_history, f)
+
+    def load_conversation(self, filename: str) -> None:
+        with open(filename, 'r') as f:
+            self.session_history = json.load(f)
 
 class API:
-    def __init__(self, api_key: str, timeout: int = 30):
+    def __init__(self, api_key: str, token_usage: TokenUsage, timeout: int = 30):
         self.api_key = api_key
         self.timeout = timeout
+        self.token_usage = token_usage
 
-    def send_message(self, message: str, system: str, previous_messages: List[Dict] = None) -> str:
+    def send_message(self, message: str, system: str, previous_messages: List[Dict] = None) -> Tuple[str, int]:
         if previous_messages is None:
             previous_messages = []
 
@@ -150,11 +172,23 @@ class API:
                 timeout=self.timeout
             )
             response.raise_for_status()
-            return response.json()['content'][0]['text']
+            data = response.json()
+
+            # Extract token usage from response
+            usage = data.get('usage', {})
+            input_tokens = usage.get('input_tokens', 0)
+            output_tokens = usage.get('output_tokens', 0)
+            total_tokens = input_tokens + output_tokens
+
+            # Update token usage
+            self.token_usage.add_tokens(total_tokens)
+
+            return data['content'][0]['text'], total_tokens
+
         except requests.Timeout:
-            return "Error: Request timed out. Please try again."
+            return "Error: Request timed out. Please try again.", 0
         except requests.RequestException as e:
-            return f"Error: API request failed - {str(e)}"
+            return f"Error: API request failed - {str(e)}", 0
 
 class Executor:
     def __init__(self):
@@ -252,11 +286,11 @@ class StyledCLI:
             'at': '#666666',        # Gray separator
             'path': '#87CEEB',      # Sky blue for path
             'arrow': '#00A67D',     # Anthropic green for prompt arrow
+            'tokens': '#FFA500',    # Orange color for token info
         })
 
-        # Rest of the initialization code remains the same
         self.config = Config()
-        self.api = API(os.getenv('ANTHROPIC_API_KEY'))
+        self.api = API(os.getenv('ANTHROPIC_API_KEY'), self.config.token_usage)
         self.history = History()
         self.executor = Executor()
         self.command_outputs = []
@@ -303,16 +337,15 @@ class StyledCLI:
             ("!share", "Share last command output with Claude"),
             ("!save <file>", "Save current session to file"),
             ("!load <file>", "Load conversation from file"),
+            ("!tokens", "Show token usage and cost"),
             ("Ctrl+C", "Stop running command"),
             ("Ctrl+D", "Exit the program"),
             ("Up/Down", "Navigate command history")
         ]
 
-        # Create command help text
+        max_cmd_length = max(len(cmd[0]) for cmd in commands)
         help_text = Text()
         help_text.append("Commands:\n", style="bold yellow")
-
-        max_cmd_length = max(len(cmd[0]) for cmd in commands)
 
         for cmd, desc in commands:
             help_text.append(f"  {cmd:<{max_cmd_length+2}}", style="cyan")
@@ -342,53 +375,16 @@ class StyledCLI:
     def print_success(self, message: str):
         self.console.print(f"[bold green]Success:[/bold green] {message}")
 
-    def interactive_mode(self):
-        self.print_welcome()
-
-        while True:
-            try:
-                user_input = self.session.prompt(
-                    lambda: self.get_styled_prompt()
-                ).strip()
-
-                if not user_input:
-                    continue
-
-
-                if not self.handle_command(user_input):
-                    # Get previous messages for context
-                    previous_messages = self.history.get_messages_for_api()
-
-                    # Send message with conversation history
-                    response = self.api.send_message(
-                        user_input,
-                        self.config.get_system_prompt(),
-                        previous_messages
-                    )
-                    print(response)
-                    self.history.add_interaction(user_input, response)
-
-            except KeyboardInterrupt:
-                self.console.print("\n[yellow]Use <Ctrl>+D or !exit[/yellow]")
-            except EOFError:
-                self.console.print("\n[green]Goodbye![/green]")
-                sys.exit(0)
-            except Exception as e:
-                self.print_error(str(e))
-
-    def single_message_mode(self, message: str):
-        previous_messages = self.history.get_messages_for_api()
-        response = self.api.send_message(
-            message,
-            self.config.get_system_prompt(),
-            previous_messages
-        )
-        print(response)
-
     def handle_command(self, cmd: str) -> bool:
         try:
             if cmd == "!exit":
+                print("\nFinal Usage:")
+                print(self.config.token_usage.get_summary())
                 sys.exit(0)
+            elif cmd == "!tokens":
+                print("\nCurrent Usage:")
+                print(self.config.token_usage.get_summary())
+                return True
             elif cmd == "!clear":
                 self.history.clear_history()
                 self.command_outputs.clear()
@@ -396,27 +392,12 @@ class StyledCLI:
                 return True
             elif cmd.startswith("!save "):
                 filename = cmd.split(maxsplit=1)[1]
-                self.save_conversation(filename)
+                self.history.save_conversation(filename)
                 return True
             elif cmd.startswith("!load "):
                 filename = cmd.split(maxsplit=1)[1]
-                self.load_conversation(filename)
+                self.history.load_conversation(filename)
                 return True
-            elif cmd.startswith("!bash"):
-                parts = cmd.split(maxsplit=1)
-                if len(parts) > 1:
-                    self.run_bash_command(parts[1])
-                else:
-                    self.run_bash_command()
-                return True
-            elif cmd.startswith("!python"):
-                parts = cmd.split(maxsplit=1)
-                if len(parts) > 1:
-                    self.run_python_command(parts[1])
-                else:
-                    self.run_python_command()
-                return True
-
             elif cmd.startswith("!run"):
                 parts = cmd.split(maxsplit=1)
                 block_num = parts[1] if len(parts) > 1 else "1"
@@ -432,7 +413,6 @@ class StyledCLI:
                     for i, cmd in enumerate(commands, 1):
                         print(f"\nExecuting block {i}:")
                         try:
-                            # Run with capture_output=True to store for !share
                             output = self.executor.execute_command(cmd, capture_output=True)
                             if output:
                                 self.command_outputs.append((i, output))
@@ -506,7 +486,6 @@ class StyledCLI:
 
                 return True
 
-
             elif cmd.startswith("!share"):
                 parts = cmd.split(maxsplit=1)
                 additional_context = parts[1] if len(parts) > 1 else ""
@@ -523,12 +502,13 @@ class StyledCLI:
                     if additional_context:
                         message = f"{additional_context}\n\n{message}"
 
-                    response = self.api.send_message(
+                    response, tokens = self.api.send_message(
                         message,
                         self.config.get_system_prompt(),
-                        self.history.get_messages_for_api()  # Include conversation history
+                        self.history.get_messages_for_api()
                     )
                     print(response)
+                    print(f"\n[tokens]Tokens used in this interaction: {tokens:,}[/tokens]")
                     self.history.add_interaction(
                         f"Command outputs with context: {additional_context}\n{formatted_outputs}",
                         response
@@ -537,27 +517,22 @@ class StyledCLI:
                     print("No command outputs to share")
                 return True
 
+            return False
+
         except KeyboardInterrupt:
             print("\nCommand cancelled")
             return True
 
     def run_bash_command(self, command: Optional[str] = None) -> None:
-        """
-        Run a bash command or start an interactive bash session.
-
-        Args:
-            command: Optional command string. If None, starts interactive session.
-        """
+        """Run a bash command or start an interactive bash session."""
         env = os.environ.copy()
         env.pop('ANTHROPIC_API_KEY', None)  # Don't expose API key to shell
 
         if command:
-            # Run single command
             try:
                 output = self.executor.execute_command(command, capture_output=True)
                 if output:
-                    self.command_outputs.append((-1, output))  # Use -1 to indicate direct bash command
-                    # Add the command and output to conversation history
+                    self.command_outputs.append((-1, output))
                     self.history.add_interaction(
                         f"!bash {command}",
                         f"Bash command output:\n```\n{output}\n```"
@@ -570,21 +545,17 @@ class StyledCLI:
                     f"Error:\n```\n{error_msg}\n```"
                 )
         else:
-            # Start interactive bash session with script recording
             print("\nStarting interactive bash session (type 'exit' to return to Claude CLI)")
             print("---")
 
             with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as typescript:
                 try:
                     shell = os.environ.get('SHELL', '/bin/bash')
-                    # Use script to record the session
                     subprocess.run(['script', '-q', typescript.name, shell], env=env)
 
-                    # Read the typescript file
                     with open(typescript.name, 'r', errors='replace') as f:
                         session_output = f.read()
 
-                    # Add the session to conversation history
                     self.history.add_interaction(
                         "!bash (interactive session)",
                         f"Bash session transcript:\n```\n{session_output}\n```"
@@ -592,7 +563,6 @@ class StyledCLI:
 
                 except KeyboardInterrupt:
                     print("\nBash session terminated")
-                    # Add the interrupted session to history
                     with open(typescript.name, 'r', errors='replace') as f:
                         session_output = f.read()
                     self.history.add_interaction(
@@ -603,82 +573,55 @@ class StyledCLI:
                     os.unlink(typescript.name)
             print("---")
 
-    def run_python_command(self, command: Optional[str] = None) -> None:
-        """
-        Run a Python command or start an interactive Python session.
+    def interactive_mode(self):
+        self.print_welcome()
 
-        Args:
-            command: Optional command string. If None, starts interactive session.
-        """
-        env = os.environ.copy()
-        env.pop('ANTHROPIC_API_KEY', None)  # Don't expose API key to Python
-
-        if command:
-            # Create a temporary Python script
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-                tmp.write(command)
-                tmp_path = tmp.name
-
+        while True:
             try:
-                # Run the script and capture output
-                result = subprocess.run(
-                    [sys.executable, tmp_path],
-                    env=env,
-                    text=True,
-                    capture_output=True
-                )
-                output = result.stdout
-                if result.stderr:
-                    output = output + "\nErrors:\n" + result.stderr
-                if output:
-                    self.command_outputs.append((-2, output))  # Use -2 to indicate direct python command
-                    # Add command and output to conversation history
-                    self.history.add_interaction(
-                        f"!python {command}",
-                        f"Python output:\n```\n{output}\n```"
+                user_input = self.session.prompt(
+                    lambda: self.get_styled_prompt()
+                ).strip()
+
+                if not user_input:
+                    continue
+
+                if not self.handle_command(user_input):
+                    # Get previous messages for context
+                    previous_messages = self.history.get_messages_for_api()
+
+                    # Send message with conversation history
+                    response, tokens = self.api.send_message(
+                        user_input,
+                        self.config.get_system_prompt(),
+                        previous_messages
                     )
+                    print(response)
+
+                    # Print token usage for this interaction
+                    print(f"\n[tokens]Tokens used in this interaction: {tokens:,}[/tokens]")
+
+                    self.history.add_interaction(user_input, response)
+
+            except KeyboardInterrupt:
+                self.console.print("\n[yellow]Use <Ctrl>+D or !exit[/yellow]")
+            except EOFError:
+                print("\nFinal Usage:")
+                print(self.config.token_usage.get_summary())
+                self.console.print("\n[green]Goodbye![/green]")
+                sys.exit(0)
             except Exception as e:
-                error_msg = f"Error executing Python command: {e}"
-                print(error_msg)
-                self.history.add_interaction(
-                    f"!python {command}",
-                    f"Error:\n```\n{error_msg}\n```"
-                )
-            finally:
-                os.unlink(tmp_path)
-        else:
-            # Start interactive Python session with transcript recording
-            print("\nStarting interactive Python session (use exit() to return to Claude CLI)")
-            print("---")
+                self.print_error(str(e))
 
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as typescript:
-                try:
-                    # Use script to record the interactive session
-                    subprocess.run(['script', '-q', typescript.name, sys.executable, '-i'], env=env)
-
-                    # Read the typescript file
-                    with open(typescript.name, 'r', errors='replace') as f:
-                        session_output = f.read()
-
-                    # Add the session to conversation history
-                    self.history.add_interaction(
-                        "!python (interactive session)",
-                        f"Python session transcript:\n```\n{session_output}\n```"
-                    )
-
-                except KeyboardInterrupt:
-                    print("\nPython session terminated")
-                    # Add the interrupted session to history
-                    with open(typescript.name, 'r', errors='replace') as f:
-                        session_output = f.read()
-                    self.history.add_interaction(
-                        "!python (interactive session - interrupted)",
-                        f"Interrupted Python session transcript:\n```\n{session_output}\n```"
-                    )
-                finally:
-                    os.unlink(typescript.name)
-            print("---")
-
+    def single_message_mode(self, message: str):
+        previous_messages = self.history.get_messages_for_api()
+        response, tokens = self.api.send_message(
+            message,
+            self.config.get_system_prompt(),
+            previous_messages
+        )
+        print(response)
+        print(f"\nTokens used: {tokens:,}")
+        print(self.config.token_usage.get_summary())
 
 def main():
     cli = StyledCLI()
