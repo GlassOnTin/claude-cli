@@ -3,11 +3,14 @@
 import os
 import sys
 import json
+import signal
 import tempfile
 import subprocess
 import requests
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from pathlib import Path
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 
 class Config:
     def __init__(self):
@@ -17,8 +20,11 @@ class Config:
 
     @staticmethod
     def check_dependencies() -> None:
-        # Python's standard library includes json, so no additional check needed
-        pass
+        try:
+            import requests
+        except ImportError:
+            print("Error: requests package is required. Install with: pip install requests")
+            sys.exit(1)
 
     @staticmethod
     def check_environment() -> None:
@@ -28,275 +34,395 @@ class Config:
 
     @staticmethod
     def init_history() -> str:
-        history_file = tempfile.mktemp(prefix='claude_cli_history_', suffix='.txt')
-        Path(history_file).touch()
-        return history_file
+        history_dir = Path.home() / '.claude-cli'
+        history_dir.mkdir(exist_ok=True)
+        history_file = history_dir / 'history.json'
+        if not history_file.exists():
+            history_file.write_text('[]')
+        return str(history_file)
 
     @staticmethod
     def get_system_prompt() -> str:
-        return f"""You are a Linux shell assistant. I will help users write and understand shell commands and scripts.
+        return f"""You are a Linux shell assistant. Help users write and understand shell commands and scripts.
 
 Key points:
-- When providing commands, always use ```bash code blocks
+- Always use ```bash code blocks for commands
 - Each command block should be self-contained and executable
 - Explain what commands do before or after the code blocks
 - Multiple command blocks are fine - users can select which to run
 
 Current context:
 Directory: {os.getcwd()}
-Shell: {os.getenv('SHELL')}
+Shell: {os.getenv('SHELL', '/bin/bash')}"""
 
-Usage:
-- `!run` or `!run 1` - Run first command
-- `!run 2` etc - Run specific command block
-- `!run select` - Choose from available commands
-- `!share` - Share last command output with me for analysis"""
-
-class API:
-    def __init__(self, config: Config):
-        self.config = config
-        self.api_key = os.getenv('ANTHROPIC_API_KEY')
-
-    def send_message(self, message: str) -> str:
-        history = ""
-        if os.path.exists(self.config.history_file):
-            with open(self.config.history_file, 'r') as f:
-                history = f.read()
-
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 1024,
-                "system": self.config.get_system_prompt(),
-                "messages": [{
-                    "role": "user",
-                    "content": f"Context: Working in bash shell on Ubuntu Linux.\n\nConversation history:\n{history}\n\nCurrent request: {message}"
-                }]
-            }
-        )
-
-        response.raise_for_status()
-        return response.json()['content'][0]['text'].strip()
 
 class History:
-    def __init__(self, history_file: str):
-        self.history_file = history_file
+    def __init__(self):
+        # Initialize with empty in-memory history
+        self.session_history = []
 
-    def get_all_commands(self) -> List[Tuple[int, str]]:
-        if not os.path.exists(self.history_file):
-            return []
-
-        with open(self.history_file, 'r') as f:
-            content = f.read()
-
-        blocks = []
-        current_block = []
-        block_num = 0
+    def extract_commands(self, text: str) -> List[str]:
+        commands = []
+        lines = text.split('\n')
         in_block = False
+        current_block = []
 
-        for line in reversed(content.split('\n')):
-            if line.startswith('Assistant:'):
-                break
-            elif line == '```bash':
+        for line in lines:
+            if line.strip() == '```bash':
                 in_block = True
-                block_num += 1
                 current_block = []
-            elif line == '```' and in_block:
+            elif line.strip() == '```' and in_block:
                 if current_block:
-                    blocks.append((block_num, '\n'.join(reversed(current_block)).strip()))
+                    commands.append('\n'.join(current_block))
                 in_block = False
             elif in_block:
                 current_block.append(line)
 
-    def get_last_command(self, block_number: Optional[str] = "1") -> str:
-        blocks = self.get_all_commands()
+        return commands
 
-        if not blocks:
-            print("No executable commands found in last response")
-            return ""
+    def add_interaction(self, message: str, response: str) -> None:
+        self.session_history.append({
+            'user': message,
+            'assistant': response,
+            'commands': self.extract_commands(response)
+        })
 
-        if block_number == "select":
-            print("Available command blocks:")
-            for num, block in blocks:
-                print(f"\nBlock {num}:\n{block}\n")
+    def get_messages_for_api(self) -> List[Dict]:
+        """Convert history into format suitable for API messages"""
+        messages = []
+        for interaction in self.session_history[-10:]:  # Limit to last 10 messages
+            messages.extend([
+                {"role": "user", "content": interaction['user']},
+                {"role": "assistant", "content": interaction['assistant']}
+            ])
+        return messages
 
-            while True:
-                try:
-                    selection = int(input(f"Select block number (1-{len(blocks)}): "))
-                    if 1 <= selection <= len(blocks):
-                        block_number = str(selection)
-                        break
-                except ValueError:
-                    pass
-                print(f"Please enter a number between 1 and {len(blocks)}")
-
-        try:
-            block_num = int(block_number)
-            if 1 <= block_num <= len(blocks):
-                return blocks[block_num - 1][1]
-            else:
-                print(f"Error: Block number {block_num} out of range")
-                return ""
-        except ValueError:
-            print(f"Error: Invalid block number format: {block_number}")
-            return ""
-
-    def add_to_history(self, message: str, response: str) -> None:
-        with open(self.history_file, 'a') as f:
-            f.write(f"User: {message}\nAssistant: {response}\n")
+    def get_last_commands(self) -> List[str]:
+        if not self.session_history:
+            return []
+        return self.session_history[-1].get('commands', [])
 
     def clear_history(self) -> None:
-        with open(self.history_file, 'w') as f:
-            f.write("")
+        self.session_history = []
+
+
+class API:
+    def __init__(self, api_key: str, timeout: int = 30):
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def send_message(self, message: str, system: str, previous_messages: List[Dict] = None) -> str:
+        if previous_messages is None:
+            previous_messages = []
+
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 1024,
+                    "system": system,
+                    "messages": previous_messages + [{"role": "user", "content": message}]
+                },
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            return response.json()['content'][0]['text']
+        except requests.Timeout:
+            return "Error: Request timed out. Please try again."
+        except requests.RequestException as e:
+            return f"Error: API request failed - {str(e)}"
 
 class Executor:
-    @staticmethod
-    def execute_command(cmd: str, capture_output: bool = False) -> Optional[str]:
-        if not cmd:
-            print("No command provided. Usage: !run <command>")
+    def __init__(self):
+        self.current_process = None
+        self.recording_file = None
+        signal.signal(signal.SIGINT, self.handle_interrupt)
+
+    def handle_interrupt(self, signum, frame):
+        if self.current_process:
+            print("\nTerminating command...")
+            try:
+                os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
+                self.current_process.wait()
+            except ProcessLookupError:
+                pass
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.current_process = None
+        else:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            raise KeyboardInterrupt
+
+    def execute_command(self, cmd: str, capture_output: bool = True) -> Optional[str]:
+        """
+        Execute a command and optionally capture its output.
+
+        Args:
+            cmd: The command to execute
+            capture_output: If True, returns the command output. If False, returns None
+                          but still executes interactively.
+        """
+        if not cmd.strip():
+            print("No command provided")
             return None
 
-        print(f"DEBUG: Executing command:\n{cmd}")  # Add debug output
-
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp:
             tmp.write(cmd)
             tmp_path = tmp.name
 
-        os.chmod(tmp_path, 0o755)
-
-        print("Executing command...")
-        print("---")
+        output = None
+        self.recording_file = None
 
         try:
+            os.chmod(tmp_path, 0o755)
             env = os.environ.copy()
             env.pop('ANTHROPIC_API_KEY', None)
 
-            result = subprocess.run(
-                ['bash', tmp_path],
-                capture_output=capture_output,
-                text=True,
-                env=env
+            print(f"\nExecuting command:\n{cmd}\n---")
+
+            # Always use script for recording, but only save output if capture_output is True
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.typescript', delete=False) as rec:
+                self.recording_file = rec.name
+
+            script_cmd = ['script', '-q', '-c', f'bash {tmp_path}', self.recording_file]
+
+            self.current_process = subprocess.Popen(
+                script_cmd,
+                env=env,
+                preexec_fn=os.setsid
             )
 
-            if capture_output:
-                output = result.stdout + result.stderr
-                print(output)
-                return output
+            try:
+                self.current_process.wait()
+                if self.current_process.returncode != 0 and self.current_process.returncode != -signal.SIGTERM:
+                    print(f"Command failed with exit code {self.current_process.returncode}")
 
-            if result.returncode != 0:
-                print(f"Command failed with exit code {result.returncode}")
-                return None
+                # Only read and return the recorded output if capture_output is True
+                if capture_output and self.recording_file and os.path.exists(self.recording_file):
+                    with open(self.recording_file, 'r', errors='replace') as f:
+                        output = f.read()
+
+            except KeyboardInterrupt:
+                self.handle_interrupt(signal.SIGINT, None)
+
+            return output
 
         finally:
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+                if self.recording_file and os.path.exists(self.recording_file):
+                    os.unlink(self.recording_file)
+            except OSError:
+                pass
             print("---")
+            self.current_process = None
+            self.recording_file = None
 
-    def execute_all_commands(self, history: History, capture_output: bool = False) -> Optional[str]:
-        blocks = history.get_all_commands()
-        if not blocks:
-            print("No commands found to execute")
-            return None
-
-        all_output = []
-        for block_num, cmd in blocks:
-            print(f"Executing block {block_num}...")
-            print("---")
-            output = self.execute_command(cmd, capture_output)
-            if capture_output and output:
-                all_output.append(f"Block {block_num} output:\n{output}")
-            print("---")
-
-        return '\n\n'.join(all_output) if capture_output else None
 
 class CLI:
     def __init__(self):
         self.config = Config()
-        self.api = API(self.config)
-        self.history = History(self.config.history_file)
+        self.api = API(os.getenv('ANTHROPIC_API_KEY'))
+        self.history = History()  # No longer needs history_file
         self.executor = Executor()
-        self.last_output = ""
+        self.command_outputs = []
+
+        # Keep command history in a file for cursor-up functionality
+        history_dir = Path.home() / '.claude-cli'
+        history_dir.mkdir(exist_ok=True)
+        self.session = PromptSession(
+            history=FileHistory(str(history_dir / 'command_history'))
+        )
+
+    def save_conversation(self, filename: str) -> None:
+        """Save the current session's conversation history to a file"""
+        try:
+            filepath = Path(filename)
+            if not filepath.suffix:
+                filepath = filepath.with_suffix('.json')
+
+            with open(filepath, 'w') as f:
+                json.dump(self.history.session_history, f, indent=2)
+            print(f"Conversation saved to {filepath}")
+        except Exception as e:
+            print(f"Error saving conversation: {e}")
+
+    def load_conversation(self, filename: str) -> None:
+        """Load conversation history from a file into the current session"""
+        try:
+            filepath = Path(filename)
+            with open(filepath) as f:
+                loaded_history = json.load(f)
+            self.history.session_history = loaded_history
+            print(f"Conversation loaded from {filepath}")
+        except Exception as e:
+            print(f"Error loading conversation: {e}")
 
     def interactive_mode(self):
-        print("? Claude CLI - Interactive Mode")
-        print("Type '!exit' to quit, '!clear' to clear history")
-        print("Type '!run [n]' to execute command block n")
-        print("Type '!run all' to execute all command blocks")
-        print("Type '!run select' to choose a command block")
-        print("Type '!share' to share last command output with Claude")
+        print("\nClaude CLI - Interactive Mode")
+        print("Commands:")
+        print("  !exit         Exit the program")
+        print("  !clear        Clear current session history")
+        print("  !run [n]      Run command block n (default: 1)")
+        print("  !run all      Run all command blocks")
+        print("  !run select   Choose command block interactively")
+        print("  !share        Share last command output with Claude")
+        print("  !save <file>  Save current session to file")
+        print("  !load <file>  Load conversation from file")
+        print("  Ctrl+C        Stop running command")
+        print("  Ctrl+D        Exit the program")
+        print("  Up/Down       Navigate command history")
 
         while True:
             try:
-                input_text = input("> ")
+                user_input = self.session.prompt("\n> ").strip()
 
-                if input_text == "!exit":
-                    os.unlink(self.config.history_file)
-                    sys.exit(0)
+                if not user_input:
+                    continue
 
-                elif input_text == "!clear":
-                    self.history.clear_history()
-                    print("Conversation history cleared")
+                if not self.handle_command(user_input):
+                    # Get previous messages for context
+                    previous_messages = self.history.get_messages_for_api()
 
-                elif input_text == "!share":
-                    if self.last_output:
-                        response = self.api.send_message(
-                            f"Here is the output from my last command(s): \n```\n{self.last_output}\n```"
-                        )
-                        print(response)
-                        self.history.add_to_history(
-                            f"Command output: \n```\n{self.last_output}\n```",
-                            response
-                        )
-                    else:
-                        print("No command output to share")
-
-                elif input_text.startswith("!run"):
-                    parts = input_text.split(maxsplit=1)
-                    block_spec = parts[1] if len(parts) > 1 else "1"
-
-                    if block_spec == "all":
-                        self.last_output = self.executor.execute_all_commands(
-                            self.history,
-                            capture_output=True
-                        )
-                    else:
-                        cmd = self.history.get_last_command(block_spec)
-                        if cmd:
-                            self.last_output = self.executor.execute_command(cmd, capture_output=True)
-
-                else:
-                    self.last_output = ""
-                    response = self.api.send_message(input_text)
+                    # Send message with conversation history
+                    response = self.api.send_message(
+                        user_input,
+                        self.config.get_system_prompt(),
+                        previous_messages
+                    )
                     print(response)
-                    self.history.add_to_history(input_text, response)
+                    self.history.add_interaction(user_input, response)
 
             except KeyboardInterrupt:
                 print("\nUse !exit to quit")
+            except EOFError:
+                print("\nGoodbye!")
+                sys.exit(0)
             except Exception as e:
                 print(f"Error: {e}")
 
-    def show_help(self):
-        print("Usage: claude-cli [options] [message]")
-        print("Options:")
-        print("  -h, --help    Show this help message")
-        print("  No arguments  Enter interactive mode")
-        sys.exit(0)
+    def single_message_mode(self, message: str):
+        previous_messages = self.history.get_messages_for_api()
+        response = self.api.send_message(
+            message,
+            self.config.get_system_prompt(),
+            previous_messages
+        )
+        print(response)
+
+    def handle_command(self, cmd: str) -> bool:
+        try:
+            if cmd == "!exit":
+                sys.exit(0)
+            elif cmd == "!clear":
+                self.history.clear_history()
+                self.command_outputs.clear()  # Clear stored outputs
+                print("History cleared")
+                return True
+            elif cmd.startswith("!save "):
+                filename = cmd.split(maxsplit=1)[1]
+                self.save_conversation(filename)
+                return True
+            elif cmd.startswith("!load "):
+                filename = cmd.split(maxsplit=1)[1]
+                self.load_conversation(filename)
+                return True
+
+            elif cmd.startswith("!run"):
+                parts = cmd.split(maxsplit=1)
+                block_num = parts[1] if len(parts) > 1 else "1"
+
+                commands = self.history.get_last_commands()
+                if not commands:
+                    print("No commands found in last response")
+                    return True
+
+                self.command_outputs.clear()
+
+                if block_num == "all":
+                    for i, cmd in enumerate(commands, 1):
+                        print(f"\nExecuting block {i}:")
+                        try:
+                            # Run with capture_output=True to store for !share
+                            output = self.executor.execute_command(cmd, capture_output=True)
+                            if output:
+                                self.command_outputs.append((i, output))
+                        except KeyboardInterrupt:
+                            print("\nExecution stopped by user")
+                            break
+
+                elif block_num == "select":
+                    print("\nAvailable commands:")
+                    for i, cmd in enumerate(commands, 1):
+                        print(f"\nBlock {i}:\n{cmd}")
+                    try:
+                        selection = int(input("\nSelect block number: "))
+                        if 1 <= selection <= len(commands):
+                            output = self.executor.execute_command(commands[selection-1], capture_output=True)
+                            if output:
+                                self.command_outputs.append((selection, output))
+                    except ValueError:
+                        print("Invalid selection")
+                    except KeyboardInterrupt:
+                        print("\nSelection cancelled")
+                else:
+                    try:
+                        idx = int(block_num) - 1
+                        if 0 <= idx < len(commands):
+                            output = self.executor.execute_command(commands[idx], capture_output=True)
+                            if output:
+                                self.command_outputs.append((idx + 1, output))
+                        else:
+                            print(f"Block number {block_num} out of range")
+                    except ValueError:
+                        print(f"Invalid block number: {block_num}")
+                return True
+
+            elif cmd == "!share":
+                if self.command_outputs:
+                    # Format multiple outputs with block numbers
+                    formatted_outputs = "\n\n".join([
+                        f"Output from block {block_num}:\n```\n{output}\n```"
+                        for block_num, output in self.command_outputs
+                    ])
+
+                    response = self.api.send_message(
+                        f"Here is the output from my commands:\n\n{formatted_outputs}",
+                        self.config.get_system_prompt()
+                    )
+                    print(response)
+                    self.history.add_interaction(
+                        f"Command outputs:\n{formatted_outputs}",
+                        response
+                    )
+                else:
+                    print("No command outputs to share")
+                return True
+
+            return False
+
+        except KeyboardInterrupt:
+            print("\nCommand cancelled")
+            return True
 
 def main():
     cli = CLI()
 
     if len(sys.argv) > 1:
         if sys.argv[1] in ['-h', '--help']:
-            cli.show_help()
+            print("Usage: claude-cli [message]")
+            print("  No arguments: Enter interactive mode")
+            print("  -h, --help:  Show this help message")
+            sys.exit(0)
         else:
-            response = cli.api.send_message(sys.argv[1])
-            print(response)
-            cli.history.add_to_history(sys.argv[1], response)
+            cli.single_message_mode(' '.join(sys.argv[1:]))
     else:
         cli.interactive_mode()
 
