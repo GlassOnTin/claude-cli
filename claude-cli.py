@@ -43,7 +43,7 @@ class Config:
 
     @staticmethod
     def get_system_prompt() -> str:
-        return f"""You are a Linux shell assistant. Help users write and understand shell commands and scripts.
+        return f"""You are a Linux shell assistant alongside an active bash prompt. Help users write and understand shell commands and scripts.
 
 Key points:
 - Always use ```bash code blocks for commands
@@ -51,32 +51,45 @@ Key points:
 - Explain what commands do before or after the code blocks
 - Multiple command blocks are fine - users can select which to run
 
+The user will execute suggested blocks using a special !run <all | select> command.
+They can then share the output with you using a !share command.
+
 Current context:
-Directory: {os.getcwd()}
-Shell: {os.getenv('SHELL', '/bin/bash')}"""
+Directory: {os.getcwd()}"""
 
 
 class History:
     def __init__(self):
-        # Initialize with empty in-memory history
         self.session_history = []
 
     def extract_commands(self, text: str) -> List[str]:
+        """
+        Extract commands from various code block formats.
+        Handles both ```bash and plain ``` blocks, preserving special characters.
+        """
         commands = []
         lines = text.split('\n')
         in_block = False
         current_block = []
 
         for line in lines:
-            if line.strip() == '```bash':
+            stripped = line.strip()
+            # Match both ```bash and ``` starts
+            if stripped.startswith('```') and not in_block:
                 in_block = True
                 current_block = []
-            elif line.strip() == '```' and in_block:
+            elif stripped == '```' and in_block:
                 if current_block:
-                    commands.append('\n'.join(current_block))
+                    # Join and strip to handle any leading/trailing whitespace
+                    command = '\n'.join(current_block).strip()
+                    if command:  # Only add non-empty commands
+                        commands.append(command)
                 in_block = False
+                current_block = []
             elif in_block:
-                current_block.append(line)
+                # If first line was ```bash, skip it
+                if current_block or not stripped == 'bash':
+                    current_block.append(line)
 
         return commands
 
